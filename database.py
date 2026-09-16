@@ -12,7 +12,7 @@ load_dotenv()
 # ─────────────────────────────────────────────
 
 db_password = os.getenv("DATABASE_PASSWORD")
-DATABASE_URL = f"postgresql://postgres:{db_password}@db.kkgtytvbdvmtqbmuirxe.supabase.co:5432/postgres"
+DATABASE_URL = f"postgresql://postgres.kkgtytvbdvmtqbmuirxe:{db_password}@aws-0-us-west-2.pooler.supabase.com:5432/postgres"
 
 engine = create_engine(DATABASE_URL)
 
