@@ -301,7 +301,7 @@ def get_critique(user_id, height, bodyweight, months_training):
     final_prompt = build_prompt(user_id, height, bodyweight, months_training)
 
     response = gemini_client.models.generate_content(
-        model="gemini-3.1-flash-lite",
+        model="gemini-3.6-flash",
         contents=final_prompt
     )
 
