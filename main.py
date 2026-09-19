@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -84,29 +84,33 @@ def critique_endpoint(current_user_id: str = Depends(get_current_user)):
 
 @app.post("/workouts")
 def log_set(set_data: WorkoutRequest):
-    new_row = Workout(
-        user_id=set_data.user_id,
-        date=set_data.date,
-        exercise=set_data.exercise,
-        set_number=set_data.set_number,
-        weight=set_data.weight,
-        reps=set_data.reps
-    )
-    session = SessionLocal()
-    session.add(new_row)
-    session.commit()
-    session.refresh(new_row)
-    session.close()
+    try:
+        new_row = Workout(
+            user_id=set_data.user_id,
+            date=set_data.date,
+            exercise=set_data.exercise,
+            set_number=set_data.set_number,
+            weight=set_data.weight,
+            reps=set_data.reps
+        )
+        session = SessionLocal()
+        session.add(new_row)
+        session.commit()
+        session.refresh(new_row)
+        session.close()
 
-    return {
-        "id": new_row.id,
-        "user_id": new_row.user_id,
-        "date": new_row.date,
-        "exercise": new_row.exercise,
-        "set_number": new_row.set_number,
-        "weight": new_row.weight,
-        "reps": new_row.reps
-    }
+        return {
+            "id": new_row.id,
+            "user_id": new_row.user_id,
+            "date": new_row.date,
+            "exercise": new_row.exercise,
+            "set_number": new_row.set_number,
+            "weight": new_row.weight,
+            "reps": new_row.reps
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not save workout: {str(e)}")
 
 
 @app.get("/workouts")
@@ -117,24 +121,29 @@ def get_workouts_endpoint(current_user_id: str = Depends(get_current_user)):
 
 @app.post("/signup")
 def signup(request: SignupRequest):
-    auth_response = supabase.auth.sign_up({
-        "email": request.email,
-        "password": request.password
-    })
+    try:
+        auth_response = supabase.auth.sign_up({
+            "email": request.email,
+            "password": request.password
+        })
+        new_user_id = auth_response.user.id
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Signup failed: {str(e)}")
 
-    new_user_id = auth_response.user.id
+    try:
+        new_profile = Profile(
+            id=new_user_id,
+            height=request.height,
+            bodyweight=request.bodyweight,
+            training_start_date=request.training_start_date
+        )
 
-    new_profile = Profile(
-        id=new_user_id,
-        height=request.height,
-        bodyweight=request.bodyweight,
-        training_start_date=request.training_start_date
-    )
-
-    session = SessionLocal()
-    session.add(new_profile)
-    session.commit()
-    session.close()
+        session = SessionLocal()
+        session.add(new_profile)
+        session.commit()
+        session.close()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Profile creation failed: {str(e)}")
 
     return {"message": "Signup successful", "user_id": new_user_id}
 
