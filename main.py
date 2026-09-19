@@ -3,7 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client
-from pipeline import get_critique, get_profile, calculate_months_training
+from pipeline import get_critique, get_profile, calculate_months_training, get_all_workouts
 from database import Workout, SessionLocal, Profile
 import os
 
@@ -107,6 +107,12 @@ def log_set(set_data: WorkoutRequest):
         "weight": new_row.weight,
         "reps": new_row.reps
     }
+
+
+@app.get("/workouts")
+def get_workouts_endpoint(current_user_id: str = Depends(get_current_user)):
+    workouts = get_all_workouts(current_user_id)
+    return {"workouts": workouts}
 
 
 @app.post("/signup")
