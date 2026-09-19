@@ -59,6 +59,12 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ProfileUpdateRequest(BaseModel):
+    height: str
+    bodyweight: str
+    training_start_date: str
+
+
 # ─────────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────────
@@ -159,3 +165,36 @@ def login(request: LoginRequest):
         "access_token": auth_response.session.access_token,
         "user_id": auth_response.user.id
     }
+
+
+@app.patch("/profile")
+def update_profile(request: ProfileUpdateRequest, current_user_id: str = Depends(get_current_user)):
+    try:
+        session = SessionLocal()
+        existing_profile = session.query(Profile).filter(Profile.id == current_user_id).first()
+
+        existing_profile.height = request.height
+        existing_profile.bodyweight = request.bodyweight
+        existing_profile.training_start_date = request.training_start_date
+
+        session.commit()
+        session.refresh(existing_profile)
+        session.close()
+
+        return {
+            "message": "Profile updated",
+            "height": existing_profile.height,
+            "bodyweight": existing_profile.bodyweight,
+            "training_start_date": existing_profile.training_start_date
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not update profile: {str(e)}")
+
+@app.get("/profile")
+def get_profile_endpoint(current_user_id: str = Depends(get_current_user)):
+    try:
+        profile = get_profile(current_user_id)
+        return profile
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not fetch profile: {str(e)}")g
