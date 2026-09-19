@@ -197,4 +197,4 @@ def get_profile_endpoint(current_user_id: str = Depends(get_current_user)):
         profile = get_profile(current_user_id)
         return profile
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not fetch profile: {str(e)}")g
+        raise HTTPException(status_code=400, detail=f"Could not fetch profile: {str(e)}")
