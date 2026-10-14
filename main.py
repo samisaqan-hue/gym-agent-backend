@@ -38,7 +38,6 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 # ─────────────────────────────────────────────
 
 class WorkoutRequest(BaseModel):
-    user_id: str
     date: str
     exercise: str
     set_number: int
@@ -89,10 +88,10 @@ def critique_endpoint(current_user_id: str = Depends(get_current_user)):
 
 
 @app.post("/workouts")
-def log_set(set_data: WorkoutRequest):
+def log_set(set_data: WorkoutRequest, current_user_id: str = Depends(get_current_user)):
     try:
         new_row = Workout(
-            user_id=set_data.user_id,
+            user_id=current_user_id,
             date=set_data.date,
             exercise=set_data.exercise,
             set_number=set_data.set_number,
