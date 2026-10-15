@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from supabase import create_client
+from supabase import create_client, AuthApiError
 from pipeline import get_critique, get_profile, calculate_months_training, get_all_workouts
 from database import Workout, SessionLocal, Profile
 import os
@@ -29,7 +29,25 @@ security = HTTPBearer()
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
-    user_response = supabase.auth.get_user(token)
+    invalid_token = HTTPException(
+        status_code=401,
+        detail="Invalid or expired token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    try:
+        user_response = supabase.auth.get_user(token)
+    except AuthApiError as e:
+        # Supabase rejected the token itself (expired, bad signature, user gone).
+        # Anything else (outage, 5xx, network failure) is left alone so it
+        # surfaces as a server error instead of signing the user out.
+        if e.status in (401, 403):
+            raise invalid_token
+        raise
+
+    if user_response is None or user_response.user is None:
+        raise invalid_token
+
     return user_response.user.id
 
 
