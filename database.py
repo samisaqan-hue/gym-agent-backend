@@ -1,8 +1,8 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, DateTime, ForeignKey, Table, func
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.dialects.postgresql import UUID
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 
 load_dotenv()
@@ -47,3 +47,27 @@ class Profile(Base):
     bodyweight = Column(String, nullable=False)
     training_start_date = Column(Date, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+# Supabase's own auth.users table. Supabase manages it; it is declared here only
+# so SQLAlchemy can resolve the critique_log.user_id foreign key.
+auth_users = Table(
+    "users",
+    Base.metadata,
+    Column("id", UUID(as_uuid=True), primary_key=True),
+    schema="auth",
+)
+
+
+class CritiqueLog(Base):
+    # One row per successful critique, used to enforce the daily limit.
+    __tablename__ = "critique_log"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("auth.users.id"), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+    )
