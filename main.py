@@ -4,8 +4,16 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, AuthApiError
 from pipeline import get_critique, get_profile, calculate_months_training, get_all_workouts
-from database import Workout, SessionLocal, Profile
+from database import Workout, SessionLocal, Profile, CritiqueLog
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+from sqlalchemy import func
+import math
 import os
+import uuid
+
+DAILY_CRITIQUE_LIMIT = 1
+CRITIQUE_TIMEZONE = "America/Chicago"
 
 load_dotenv()
 
@@ -93,6 +101,34 @@ def read_root():
 
 @app.post("/critique")
 def critique_endpoint(current_user_id: str = Depends(get_current_user)):
+    # The limit resets at midnight in CRITIQUE_TIMEZONE (a calendar day, not a
+    # rolling 24 hours). created_at is stored in UTC, so convert the day's
+    # start to UTC before comparing.
+    user_uuid = uuid.UUID(current_user_id)
+    tz = ZoneInfo(CRITIQUE_TIMEZONE)
+    now_utc = datetime.now(timezone.utc)
+    today_local = now_utc.astimezone(tz).date()
+    start_of_today_utc = datetime.combine(today_local, time.min, tzinfo=tz).astimezone(timezone.utc)
+    start_of_tomorrow_utc = datetime.combine(today_local + timedelta(days=1), time.min, tzinfo=tz).astimezone(timezone.utc)
+
+    session = SessionLocal()
+    try:
+        used_today = (
+            session.query(func.count(CritiqueLog.id))
+            .filter(CritiqueLog.user_id == user_uuid, CritiqueLog.created_at >= start_of_today_utc)
+            .scalar()
+        )
+    finally:
+        session.close()
+
+    if used_today >= DAILY_CRITIQUE_LIMIT:
+        retry_after = max(1, math.ceil((start_of_tomorrow_utc - now_utc).total_seconds()))
+        raise HTTPException(
+            status_code=429,
+            detail="You've reached your daily critique limit. Your next critique is available tomorrow at 12:00 AM Central Time.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     profile = get_profile(current_user_id)
     months_training = calculate_months_training(profile["training_start_date"])
 
@@ -102,7 +138,17 @@ def critique_endpoint(current_user_id: str = Depends(get_current_user)):
         bodyweight=profile["bodyweight"],
         months_training=months_training
     )
-    return {"critique": critique_text}
+
+    # Only record the critique once Gemini has succeeded, so a failed attempt
+    # doesn't use up the user's daily critique.
+    session = SessionLocal()
+    try:
+        session.add(CritiqueLog(user_id=user_uuid, created_at=datetime.now(timezone.utc)))
+        session.commit()
+    finally:
+        session.close()
+
+    return {"critique": critique_text, "remaining": max(0, DAILY_CRITIQUE_LIMIT - used_today - 1)}
 
 
 @app.post("/workouts")
