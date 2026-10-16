@@ -124,7 +124,22 @@ def latest_change_percent(sorted_summaries):
     return _percent_change(baseline, sorted_summaries[-1]["estimated_1rm"])
 
 
+def skip_leading_bodyweight_sessions(sorted_summaries):
+    """Drop the sessions at the start whose best 1RM is 0 (e.g. pull-ups at
+    bodyweight before any weight was added), but only if a later session has a
+    positive 1RM. The weighted trend then starts at the first weighted session.
+    Zeros in the middle or at the end are kept: going back to bodyweight is a
+    real change. A lift that is 0 in every session is returned unchanged."""
+    for i, summary in enumerate(sorted_summaries):
+        if summary["estimated_1rm"] > 0:
+            return sorted_summaries[i:]
+    return sorted_summaries
+
+
 def classify_trend(sorted_summaries, months_training=None):
+    # Every rule below, including MIN_SESSIONS, the starting session and the
+    # extra fields, works on the sessions from the first weighted one onwards.
+    sorted_summaries = skip_leading_bodyweight_sessions(sorted_summaries)
     num_sessions = len(sorted_summaries)
 
     if num_sessions < MIN_SESSIONS:
@@ -242,7 +257,8 @@ def get_all_exercise_trends(user_id):
         summaries = build_session_summaries(grouped)
         exercise_trends[exercise] = classify_trend(summaries)
 
-        latest_change = latest_change_percent(summaries)
+        # Same starting point as classify_trend.
+        latest_change = latest_change_percent(skip_leading_bodyweight_sessions(summaries))
         if latest_change is not None and latest_change <= -SHARP_DROP_PCT:
             sharp_drop_dates[exercise] = _as_date(summaries[-1]["Date"])
 
@@ -347,6 +363,10 @@ def get_latest_workout(workout_data, today=None):
                 "previous_best_estimated_1rm": round(previous["estimated_1rm"], 1),
                 "percent_change_vs_previous": None if change is None else round(change, 1),
             })
+            if change is None:
+                # No percentage because the previous session was at weight 0.
+                # Says whether the latest one was too, or weight was added.
+                comparison["latest_session_bodyweight"] = latest["estimated_1rm"] <= 0
         else:
             comparison["first_time_logged"] = True
         exercises.append(comparison)
@@ -478,9 +498,14 @@ SECTION 1 (Workout Summary) covers ONLY the latest workout, not the full history
   "percent_change_vs_previous" value and the "previous_session_date". If 
   "first_time_logged" is true, say it is the first time this exercise was logged, 
   so there is nothing to compare with yet.
-- If "percent_change_vs_previous" is null for an exercise, say there is no percentage 
-  comparison available for it (it is probably a bodyweight exercise logged at weight 
-  0). Do not calculate any comparison yourself.
+- If "percent_change_vs_previous" is null for an exercise, the previous session was 
+  logged at weight 0, so there is no percentage comparison. Do not calculate or invent 
+  any comparison or percentage yourself.
+  - If "latest_session_bodyweight" is true, say there is no percentage comparison 
+    available for it (it is probably a bodyweight exercise logged at weight 0).
+  - If "latest_session_bodyweight" is false, say the user added weight this session 
+    after a previous session at bodyweight, and that no percentage comparison is 
+    available. Do not call it a bodyweight exercise.
 - If no workouts have been logged, say so and nothing else in this section.
 Sections 2-5 use the full workout history and the computed trends.
 
