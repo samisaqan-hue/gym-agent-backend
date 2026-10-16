@@ -2,6 +2,7 @@ import json
 import os
 import statistics
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from google import genai
 from database import SessionLocal, Workout, Profile
 
@@ -19,6 +20,10 @@ HIGH_REP_THRESHOLD = 10         # more reps than this makes the estimated 1RM le
 PLATEAU_WINDOW_DROP_PCT = 5     # plateau: latest two-session average no more than this % below the prior two...
 IMPROVING_WINDOW_GAIN_PCT = 2   # ...and less than this % above them; this % or more -> "improving"
 OTHER_LIFTS_WINDOW_DAYS = 7     # other lifts' sharp drops within this many days count as the same period
+
+# "Today" for the latest-workout summary. Matches CRITIQUE_TIMEZONE in main.py,
+# so a workout logged in the evening in Central Time still counts as today.
+LATEST_WORKOUT_TIMEZONE = "America/Chicago"
 
 # ─────────────────────────────────────────────
 # GEMINI CLIENT
@@ -286,6 +291,69 @@ def calculate_months_training(training_start_date):
     return max(months, 0)
 
 
+def get_latest_workout(workout_data, today=None):
+    """The user's most recent workout: every set logged on the latest date,
+    plus, for each exercise in it, the percentage change in best estimated
+    1RM versus that exercise's previous session. None if nothing is logged."""
+    if not workout_data:
+        return None
+
+    if today is None:
+        today = datetime.now(ZoneInfo(LATEST_WORKOUT_TIMEZONE)).date()
+
+    latest_date = max(_as_date(entry["date"]) for entry in workout_data)
+    latest_sets = [entry for entry in workout_data if _as_date(entry["date"]) == latest_date]
+
+    exercise_order = []
+    for entry in latest_sets:
+        if entry["exercise"] not in exercise_order:
+            exercise_order.append(entry["exercise"])
+    latest_sets.sort(key=lambda entry: (exercise_order.index(entry["exercise"]), entry["set_number"]))
+
+    exercises = []
+    for exercise in exercise_order:
+        # Exercises are matched by exact name.
+        entries = [entry for entry in workout_data if entry["exercise"] == exercise]
+        sessions = build_session_summaries(group_by_date(entries))
+        sessions.sort(key=lambda summary: _as_date(summary["Date"]))
+        latest = sessions[-1]
+        earlier = [summary for summary in sessions if _as_date(summary["Date"]) < latest_date]
+
+        comparison = {
+            "exercise": exercise,
+            "best_estimated_1rm": round(latest["estimated_1rm"], 1),
+        }
+        if earlier:
+            previous = earlier[-1]
+            comparison.update({
+                "first_time_logged": False,
+                "previous_session_date": _as_date(previous["Date"]).isoformat(),
+                "previous_best_estimated_1rm": round(previous["estimated_1rm"], 1),
+                "percent_change_vs_previous": round(
+                    _percent_change(previous["estimated_1rm"], latest["estimated_1rm"]), 1
+                ),
+            })
+        else:
+            comparison["first_time_logged"] = True
+        exercises.append(comparison)
+
+    return {
+        "date": latest_date.isoformat(),
+        "is_today": latest_date == today,
+        "days_ago": (today - latest_date).days,
+        "sets": [
+            {
+                "exercise": entry["exercise"],
+                "set_number": entry["set_number"],
+                "weight": entry["weight"],
+                "reps": entry["reps"],
+            }
+            for entry in latest_sets
+        ],
+        "exercises": exercises,
+    }
+
+
 # ─────────────────────────────────────────────
 # PROMPT BUILDING
 # ─────────────────────────────────────────────
@@ -294,11 +362,15 @@ def build_prompt(user_id, height, bodyweight, months_training):
     workout_data = get_all_workouts(user_id)
     all_trends = get_all_exercise_trends(user_id)
 
+    latest_workout = get_latest_workout(workout_data)
+
     workout_json = json.dumps(workout_data, indent=2, default=str)
     trends_json = json.dumps(all_trends, indent=2)
+    latest_workout_json = json.dumps(latest_workout, indent=2)
 
-    prompt = f"""You are an expert AI personal trainer. You analyze a user's workout history and give 
-them an honest, statistics-driven progress critique after each workout.
+    prompt = f"""You are an expert AI personal trainer. After each workout, you give the user an 
+honest, statistics-driven critique of their latest workout, in the context of their 
+full workout history.
 
 USER CONTEXT:
 - Height: {height}
@@ -311,6 +383,16 @@ You will receive the user's full workout history as JSON, structured like this:
 {workout_json}
 
 Each workout entry contains one exercise, the date, and one set's weight/reps.
+
+LATEST WORKOUT:
+This is the user's most recent workout (calculated in code, not by you): its date, 
+whether that date is today ("is_today") and how many days ago it was ("days_ago"), 
+every set logged that day, and for each exercise a comparison with that exercise's 
+previous session. "percent_change_vs_previous" is the percentage change in best 
+estimated 1RM versus the previous session; "first_time_logged" is true when there 
+is no earlier session to compare with. If it is null, no workouts have been logged.
+
+{latest_workout_json}
 
 COMPUTED TRENDS:
 For each exercise, you will also be given pre-computed trend data (calculated in code, 
@@ -349,7 +431,7 @@ the sessions before it. It is NOT yet a decline. For an exercise with this label
 
 YOUR TASK:
 Using the user's context, workout history, and computed trends, analyze:
-1. Overall progress since their last workout and over their full recorded history
+1. The latest workout only (see SECTION 1 below)
 2. Which exercises/muscle groups are trending well
 3. Which exercises/muscle groups are plateauing or declining
 4. Muscle groups that appear to be undertrained or skipped entirely
@@ -363,13 +445,27 @@ RULES:
 - If an exercise's trend is "not enough data", you must NOT mention any percentage 
   change, direction (up/down), or improvement/decline for that exercise anywhere in 
   your response — not even as a tentative observation. Simply state there is not 
-  enough data yet, and nothing more about its trend.
+  enough data yet, and nothing more about its trend. The only exception is Section 1: 
+  there you may state its exact "percent_change_vs_previous" as a comparison with the 
+  previous session only, while saying there is not yet enough data to call a trend.
 - When referencing a percentage change for any exercise, use the exact "percent_change" 
-  value provided in the computed trends data — do not calculate or estimate your own 
-  percentage.
+  value provided in the computed trends data (or, in Section 1, the exact 
+  "percent_change_vs_previous" value from the latest workout) — do not calculate or 
+  estimate your own percentage.
 - Only use the word "plateau" (or "plateauing") for an exercise whose computed trend 
   is exactly "plateau".
 - Do not invent data that wasn't provided.
+
+SECTION 1 (Workout Summary) covers ONLY the latest workout, not the full history:
+- State the workout's date. If "is_today" is false, say plainly that this workout 
+  was not today and was "days_ago" days ago.
+- List which exercises were done and the sets (weight x reps) for each.
+- For each exercise, say how it compared with its previous session using the exact 
+  "percent_change_vs_previous" value and the "previous_session_date". If 
+  "first_time_logged" is true, say it is the first time this exercise was logged, 
+  so there is nothing to compare with yet.
+- If no workouts have been logged, say so and nothing else in this section.
+Sections 2-5 use the full workout history and the computed trends.
 
 OUTPUT FORMAT:
 Respond in exactly this structure, using these section headers:
