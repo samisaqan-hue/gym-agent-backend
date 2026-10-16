@@ -54,7 +54,7 @@ def test_mixed_zero_sessions_do_not_raise(one_rms):
 
 
 def test_zero_denominator_gives_not_enough_data_without_percentages():
-    result = classify_trend(summaries([0, 100, 100, 100, 100]))
+    result = classify_trend(summaries([100, 100, 0, 0, 100]))
     assert result == {"trend": "not enough data", "sessions_logged": 5}
 
 
