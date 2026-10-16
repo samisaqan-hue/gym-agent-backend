@@ -1,9 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
 from supabase import create_client, AuthApiError
-from pipeline import get_critique, get_profile, calculate_months_training, get_all_workouts
+from pipeline import get_critique, get_profile, calculate_months_training
 from database import Workout, SessionLocal, Profile, CritiqueLog
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -69,6 +69,15 @@ class WorkoutRequest(BaseModel):
     set_number: int
     weight: float
     reps: int
+
+
+class WorkoutUpdateRequest(BaseModel):
+    # Only weight and reps can be corrected. Any other field (date, exercise,
+    # set_number, ...) is rejected rather than silently ignored.
+    model_config = ConfigDict(extra="forbid")
+
+    weight: float = Field(ge=0, allow_inf_nan=False, strict=True)
+    reps: int = Field(ge=1, strict=True)
 
 
 class SignupRequest(BaseModel):
@@ -182,10 +191,58 @@ def log_set(set_data: WorkoutRequest, current_user_id: str = Depends(get_current
         raise HTTPException(status_code=400, detail=f"Could not save workout: {str(e)}")
 
 
+def workout_to_dict(row):
+    return {
+        "id": row.id,
+        "date": row.date,
+        "exercise": row.exercise,
+        "set_number": row.set_number,
+        "weight": row.weight,
+        "reps": row.reps
+    }
+
+
 @app.get("/workouts")
 def get_workouts_endpoint(current_user_id: str = Depends(get_current_user)):
-    workouts = get_all_workouts(current_user_id)
-    return {"workouts": workouts}
+    # Own query rather than pipeline.get_all_workouts, so adding "id" here
+    # doesn't change the data sent to Gemini.
+    session = SessionLocal()
+    try:
+        rows = (
+            session.query(Workout)
+            .filter(Workout.user_id == uuid.UUID(current_user_id))
+            .order_by(Workout.date, Workout.id)
+            .all()
+        )
+    finally:
+        session.close()
+    return {"workouts": [workout_to_dict(row) for row in rows]}
+
+
+@app.patch("/workouts/{workout_id}")
+def update_workout(
+    workout_id: int,
+    changes: WorkoutUpdateRequest,
+    current_user_id: str = Depends(get_current_user),
+):
+    session = SessionLocal()
+    try:
+        # Missing and someone else's set get the same 404, so ids can't be probed.
+        row = (
+            session.query(Workout)
+            .filter(Workout.id == workout_id, Workout.user_id == uuid.UUID(current_user_id))
+            .first()
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Workout set not found")
+
+        row.weight = changes.weight
+        row.reps = changes.reps
+        session.commit()
+        session.refresh(row)
+        return workout_to_dict(row)
+    finally:
+        session.close()
 
 
 @app.post("/signup")
