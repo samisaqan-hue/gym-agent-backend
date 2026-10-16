@@ -106,13 +106,18 @@ def _as_date(value):
 
 
 def _percent_change(old, new):
-    """Percentage change from old to new. Negative means a drop."""
+    """Percentage change from old to new. Negative means a drop. None when old
+    isn't positive (e.g. a bodyweight exercise logged at weight 0), since a
+    percentage of 0 can't be computed."""
+    if old <= 0:
+        return None
     return ((new - old) / old) * 100
 
 
 def latest_change_percent(sorted_summaries):
     """Percentage change from the average of the two sessions before the latest
-    one to the latest one. None if there are fewer than 3 sessions."""
+    one to the latest one. None if there are fewer than 3 sessions, or if that
+    average is 0."""
     if len(sorted_summaries) < 3:
         return None
     baseline = (sorted_summaries[-3]["estimated_1rm"] + sorted_summaries[-2]["estimated_1rm"]) / 2
@@ -130,6 +135,17 @@ def classify_trend(sorted_summaries, months_training=None):
 
     one_rms = [s["estimated_1rm"] for s in sorted_summaries]
 
+    # Every percentage below divides by one of these. If any is 0 (e.g. a
+    # bodyweight exercise logged at weight 0), a weight-based trend doesn't apply.
+    starting_1rm = one_rms[0]
+    prior_two_avg = (one_rms[-4] + one_rms[-3]) / 2
+    latest_baseline_avg = (one_rms[-3] + one_rms[-2]) / 2
+    if min(starting_1rm, prior_two_avg, latest_baseline_avg) <= 0:
+        return {
+            "trend": "not enough data",
+            "sessions_logged": num_sessions
+        }
+
     # Count drops in a row that end at the latest session. An older losing
     # streak that has since recovered doesn't count.
     recent_drops = 0
@@ -139,7 +155,6 @@ def classify_trend(sorted_summaries, months_training=None):
         else:
             break
 
-    starting_1rm = one_rms[0]
     current_1rm = one_rms[-1]
     percent_change = round(_percent_change(starting_1rm, current_1rm), 1)
 
@@ -152,7 +167,6 @@ def classify_trend(sorted_summaries, months_training=None):
 
     # Both of the last two sessions clearly below the two before them. One bad
     # session on its own never counts.
-    prior_two_avg = (one_rms[-4] + one_rms[-3]) / 2
     last_two_both_low = all(
         _percent_change(prior_two_avg, value) <= -DECLINE_WINDOW_DROP_PCT
         for value in one_rms[-2:]
@@ -171,7 +185,7 @@ def classify_trend(sorted_summaries, months_training=None):
     if latest_change <= -SHARP_DROP_PCT:
         latest = sorted_summaries[-1]
         previous = sorted_summaries[-2]
-        baseline_1rm = (one_rms[-3] + one_rms[-2]) / 2
+        baseline_1rm = latest_baseline_avg
         drop_percent = round(-latest_change, 1)  # reported as a positive number
         days_since_previous = (_as_date(latest["Date"]) - _as_date(previous["Date"])).days
         latest_reps = latest["actual_reps"]
@@ -325,13 +339,13 @@ def get_latest_workout(workout_data, today=None):
         }
         if earlier:
             previous = earlier[-1]
+            # None when the previous best 1RM is 0 (e.g. a bodyweight exercise).
+            change = _percent_change(previous["estimated_1rm"], latest["estimated_1rm"])
             comparison.update({
                 "first_time_logged": False,
                 "previous_session_date": _as_date(previous["Date"]).isoformat(),
                 "previous_best_estimated_1rm": round(previous["estimated_1rm"], 1),
-                "percent_change_vs_previous": round(
-                    _percent_change(previous["estimated_1rm"], latest["estimated_1rm"]), 1
-                ),
+                "percent_change_vs_previous": None if change is None else round(change, 1),
             })
         else:
             comparison["first_time_logged"] = True
@@ -464,6 +478,9 @@ SECTION 1 (Workout Summary) covers ONLY the latest workout, not the full history
   "percent_change_vs_previous" value and the "previous_session_date". If 
   "first_time_logged" is true, say it is the first time this exercise was logged, 
   so there is nothing to compare with yet.
+- If "percent_change_vs_previous" is null for an exercise, say there is no percentage 
+  comparison available for it (it is probably a bodyweight exercise logged at weight 
+  0). Do not calculate any comparison yourself.
 - If no workouts have been logged, say so and nothing else in this section.
 Sections 2-5 use the full workout history and the computed trends.
 
