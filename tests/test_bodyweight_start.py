@@ -134,6 +134,7 @@ def test_latest_workout_bodyweight_then_weighted_has_no_percent(monkeypatch):
         "previous_session_date": "2026-10-09",
         "previous_best_estimated_1rm": 0.0,
         "percent_change_vs_previous": None,
+        "latest_session_bodyweight": False,
     }
 
     monkeypatch.setattr(pipeline, "get_all_workouts", lambda user_id: history)
@@ -144,3 +145,76 @@ def test_latest_workout_bodyweight_then_weighted_has_no_percent(monkeypatch):
         "1. Workout Summary\n2. Strong Points\n3. Weak Points / Plateaus\n"
         "4. Muscles Not Being Trained\n5. Next Workout Goals\n"
     )
+
+
+SECTION_1_NULL_RULE = """- If "percent_change_vs_previous" is null for an exercise, the previous session was 
+  logged at weight 0, so there is no percentage comparison. Do not calculate or invent 
+  any comparison or percentage yourself.
+  - If "latest_session_bodyweight" is true, say there is no percentage comparison 
+    available for it (it is probably a bodyweight exercise logged at weight 0).
+  - If "latest_session_bodyweight" is false, say the user added weight this session 
+    after a previous session at bodyweight, and that no percentage comparison is 
+    available. Do not call it a bodyweight exercise.
+"""
+
+OLD_BODYWEIGHT_WORDING = (
+    "say there is no percentage comparison \n"
+    "    available for it (it is probably a bodyweight exercise logged at weight 0)."
+)
+
+
+def prompt_for(monkeypatch, history):
+    monkeypatch.setattr(pipeline, "get_all_workouts", lambda user_id: history)
+    monkeypatch.setattr(pipeline, "get_all_exercise_trends", lambda user_id: {})
+    return pipeline.build_prompt("user", "180cm", "80kg", 12)
+
+
+def test_prompt_for_weight_added_after_bodyweight(monkeypatch):
+    history = [
+        workout_set(date(2026, 10, 9), "pull-up", 1, 0, 8),
+        workout_set(date(2026, 10, 16), "pull-up", 1, 10, 6),
+    ]
+
+    pull_up = get_latest_workout(history)["exercises"][0]
+    assert pull_up["percent_change_vs_previous"] is None
+    assert pull_up["latest_session_bodyweight"] is False
+    assert pull_up["first_time_logged"] is False
+
+    prompt = prompt_for(monkeypatch, history)
+
+    assert '"percent_change_vs_previous": null' in prompt
+    assert '"latest_session_bodyweight": false' in prompt
+    assert SECTION_1_NULL_RULE in prompt
+    assert prompt.endswith(
+        "1. Workout Summary\n2. Strong Points\n3. Weak Points / Plateaus\n"
+        "4. Muscles Not Being Trained\n5. Next Workout Goals\n"
+    )
+
+
+def test_prompt_for_always_bodyweight_lift_keeps_the_old_wording(monkeypatch):
+    history = [
+        workout_set(date(2026, 10, 9), "pull-up", 1, 0, 8),
+        workout_set(date(2026, 10, 16), "pull-up", 1, 0, 10),
+    ]
+
+    pull_up = get_latest_workout(history)["exercises"][0]
+    assert pull_up["percent_change_vs_previous"] is None
+    assert pull_up["latest_session_bodyweight"] is True
+
+    prompt = prompt_for(monkeypatch, history)
+
+    assert '"latest_session_bodyweight": true' in prompt
+    assert OLD_BODYWEIGHT_WORDING in prompt
+
+
+def test_lifts_with_a_percentage_get_no_new_field():
+    history = [
+        workout_set(date(2026, 10, 9), "bench", 1, 200, 5),
+        workout_set(date(2026, 10, 16), "bench", 1, 180, 5),
+        workout_set(date(2026, 10, 16), "dip", 1, 0, 10),
+    ]
+
+    exercises = {e["exercise"]: e for e in get_latest_workout(history, today=TODAY)["exercises"]}
+
+    assert "latest_session_bodyweight" not in exercises["bench"]
+    assert "latest_session_bodyweight" not in exercises["dip"]  # first time logged
