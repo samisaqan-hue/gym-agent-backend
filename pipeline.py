@@ -10,6 +10,7 @@ from database import SessionLocal, Workout, Profile
 # ─────────────────────────────────────────────
 
 MIN_SESSIONS = 4                # fewer sessions than this -> "not enough data"
+DECLINING_STREAK_DROPS = 3      # this many drops in a row, ending at the latest session -> "declining"
 DECLINE_WINDOW_DROP_PCT = 5     # both of the last two sessions this far below the two before them -> "declining"
 SHARP_DROP_PCT = 10             # latest session this far below the two before it -> "sharp recent drop (unconfirmed)"
 LIKELY_TYPO_DROP_PCT = 20       # a sharp drop at least this big may be a logging mistake
@@ -99,17 +100,18 @@ def _as_date(value):
     return value
 
 
-def _percent_below(value, baseline):
-    return ((baseline - value) / baseline) * 100
+def _percent_change(old, new):
+    """Percentage change from old to new. Negative means a drop."""
+    return ((new - old) / old) * 100
 
 
-def latest_drop_percent(sorted_summaries):
-    """How far (in %) the latest session's 1RM is below the average of the two
-    sessions before it. Negative means it is above. None if under 3 sessions."""
+def latest_change_percent(sorted_summaries):
+    """Percentage change from the average of the two sessions before the latest
+    one to the latest one. None if there are fewer than 3 sessions."""
     if len(sorted_summaries) < 3:
         return None
     baseline = (sorted_summaries[-3]["estimated_1rm"] + sorted_summaries[-2]["estimated_1rm"]) / 2
-    return _percent_below(sorted_summaries[-1]["estimated_1rm"], baseline)
+    return _percent_change(baseline, sorted_summaries[-1]["estimated_1rm"])
 
 
 def classify_trend(sorted_summaries, months_training=None):
@@ -123,18 +125,18 @@ def classify_trend(sorted_summaries, months_training=None):
 
     one_rms = [s["estimated_1rm"] for s in sorted_summaries]
 
-    declining_streak = 1
-    max_declining_streak = 1
-    for i in range(1, num_sessions):
+    # Count drops in a row that end at the latest session. An older losing
+    # streak that has since recovered doesn't count.
+    recent_drops = 0
+    for i in range(num_sessions - 1, 0, -1):
         if one_rms[i] < one_rms[i - 1]:
-            declining_streak += 1
-            max_declining_streak = max(max_declining_streak, declining_streak)
+            recent_drops += 1
         else:
-            declining_streak = 1
+            break
 
     starting_1rm = one_rms[0]
     current_1rm = one_rms[-1]
-    percent_change = round(((current_1rm - starting_1rm) / starting_1rm) * 100, 1)
+    percent_change = round(_percent_change(starting_1rm, current_1rm), 1)
 
     base_result = {
         "sessions_logged": num_sessions,
@@ -147,24 +149,25 @@ def classify_trend(sorted_summaries, months_training=None):
     # session on its own never counts.
     prior_two_avg = (one_rms[-4] + one_rms[-3]) / 2
     last_two_both_low = all(
-        _percent_below(value, prior_two_avg) >= DECLINE_WINDOW_DROP_PCT
+        _percent_change(prior_two_avg, value) <= -DECLINE_WINDOW_DROP_PCT
         for value in one_rms[-2:]
     )
 
-    if max_declining_streak >= 3 or last_two_both_low:
+    if recent_drops >= DECLINING_STREAK_DROPS or last_two_both_low:
         return {
             "trend": "declining",
-            "declining_streak": max_declining_streak,
+            # Number of sessions in the current downward run (drops + 1).
+            "declining_streak": recent_drops + 1,
             **base_result
         }
 
     # A single low latest session: flag it, but don't call it a decline yet.
-    drop = latest_drop_percent(sorted_summaries)
-    if drop >= SHARP_DROP_PCT:
+    latest_change = latest_change_percent(sorted_summaries)
+    if latest_change <= -SHARP_DROP_PCT:
         latest = sorted_summaries[-1]
         previous = sorted_summaries[-2]
         baseline_1rm = (one_rms[-3] + one_rms[-2]) / 2
-        drop_percent = round(drop, 1)
+        drop_percent = round(-latest_change, 1)  # reported as a positive number
         days_since_previous = (_as_date(latest["Date"]) - _as_date(previous["Date"])).days
         latest_reps = latest["actual_reps"]
         return {
@@ -183,7 +186,7 @@ def classify_trend(sorted_summaries, months_training=None):
 
     # Judge the most recent window only, not whether the lifter ever improved.
     recent_two_avg = (one_rms[-2] + one_rms[-1]) / 2
-    window_change = ((recent_two_avg - prior_two_avg) / prior_two_avg) * 100
+    window_change = _percent_change(prior_two_avg, recent_two_avg)
 
     if window_change >= IMPROVING_WINDOW_GAIN_PCT:
         trend_label = "improving"
@@ -220,8 +223,8 @@ def get_all_exercise_trends(user_id):
         summaries = build_session_summaries(grouped)
         exercise_trends[exercise] = classify_trend(summaries)
 
-        drop = latest_drop_percent(summaries)
-        if drop is not None and drop >= SHARP_DROP_PCT:
+        latest_change = latest_change_percent(summaries)
+        if latest_change is not None and latest_change <= -SHARP_DROP_PCT:
             sharp_drop_dates[exercise] = _as_date(summaries[-1]["Date"])
 
     # If several lifts dropped sharply around the same time, the cause may be

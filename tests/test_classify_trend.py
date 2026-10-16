@@ -56,6 +56,26 @@ def test_two_low_sessions_in_a_row_are_declining(one_rms):
     assert trend_of(one_rms) == "declining"
 
 
+@pytest.mark.parametrize("fourth", [185, 189.9, 150])
+def test_three_drops_in_a_row_are_declining(fourth):
+    result = classify_trend(make_summaries([200, 195, 190, fourth]))
+    assert result["trend"] == "declining"
+    assert result["declining_streak"] == 4
+
+
+def test_two_drops_in_a_row_are_not_declining():
+    assert trend_of([200, 200, 195, 190]) != "declining"
+
+
+def test_old_losing_streak_that_recovered_is_not_declining():
+    assert trend_of([200, 190, 180, 170, 175, 185, 195, 205]) != "declining"
+
+
+def test_losing_streak_must_end_at_latest_session():
+    # Three drops, then one session up: the streak is broken.
+    assert trend_of([200, 195, 190, 185, 186]) != "declining"
+
+
 def test_flat_sessions_are_plateau():
     assert trend_of([200, 200, 200, 200]) == "plateau"
 
@@ -86,6 +106,16 @@ def test_rules_use_percentages_so_light_and_heavy_lifts_match():
     heavy = [200, 205, 195, 200, 155]
     light = [v / 10 for v in heavy]  # same shape, a tenth of the weight
     assert trend_of(heavy) == trend_of(light) == UNCONFIRMED
+
+
+def test_same_percentage_drop_gives_same_result_for_heavy_and_light_lift():
+    heavy = classify_trend(make_summaries([300, 300, 300, 300, 240]))
+    light = classify_trend(make_summaries([30, 30, 30, 30, 24]))
+
+    assert heavy["trend"] == light["trend"] == UNCONFIRMED
+    for key in ("drop_percent", "percent_change", "likely_typo"):
+        assert heavy[key] == light[key]
+    assert heavy["drop_percent"] == 20.0
 
 
 def test_small_dip_is_not_a_sharp_drop():
