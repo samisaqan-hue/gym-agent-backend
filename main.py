@@ -108,12 +108,13 @@ def read_root():
     return {"message": "Gym agent backend is running"}
 
 
-@app.post("/critique")
-def critique_endpoint(current_user_id: str = Depends(get_current_user)):
-    # The limit resets at midnight in CRITIQUE_TIMEZONE (a calendar day, not a
-    # rolling 24 hours). created_at is stored in UTC, so convert the day's
-    # start to UTC before comparing.
-    user_uuid = uuid.UUID(current_user_id)
+def check_daily_critique_limit(user_uuid):
+    """How many critiques the user has had today, and, if they've reached the
+    limit, the seconds until it resets (None while they're under it).
+
+    The limit resets at midnight in CRITIQUE_TIMEZONE (a calendar day, not a
+    rolling 24 hours). created_at is stored in UTC, so the day's start is
+    converted to UTC before comparing. Read-only: nothing is written."""
     tz = ZoneInfo(CRITIQUE_TIMEZONE)
     now_utc = datetime.now(timezone.utc)
     today_local = now_utc.astimezone(tz).date()
@@ -130,8 +131,25 @@ def critique_endpoint(current_user_id: str = Depends(get_current_user)):
     finally:
         session.close()
 
+    retry_after = None
     if used_today >= DAILY_CRITIQUE_LIMIT:
         retry_after = max(1, math.ceil((start_of_tomorrow_utc - now_utc).total_seconds()))
+    return used_today, retry_after
+
+
+@app.get("/critique/status")
+def critique_status(current_user_id: str = Depends(get_current_user)):
+    # Lets the app show or hide the critique button without generating one.
+    _, retry_after = check_daily_critique_limit(uuid.UUID(current_user_id))
+    return {"available": retry_after is None, "retry_after_seconds": retry_after}
+
+
+@app.post("/critique")
+def critique_endpoint(current_user_id: str = Depends(get_current_user)):
+    user_uuid = uuid.UUID(current_user_id)
+    used_today, retry_after = check_daily_critique_limit(user_uuid)
+
+    if retry_after is not None:
         raise HTTPException(
             status_code=429,
             detail="You've reached your daily critique limit. Your next critique is available tomorrow at 12:00 AM Central Time.",
