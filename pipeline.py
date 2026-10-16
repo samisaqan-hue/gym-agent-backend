@@ -1,8 +1,23 @@
 import json
 import os
+import statistics
 from datetime import date, datetime
 from google import genai
 from database import SessionLocal, Workout, Profile
+
+# ─────────────────────────────────────────────
+# TREND SETTINGS (all drops and gains are percentages, not raw weight)
+# ─────────────────────────────────────────────
+
+MIN_SESSIONS = 4                # fewer sessions than this -> "not enough data"
+DECLINE_WINDOW_DROP_PCT = 5     # both of the last two sessions this far below the two before them -> "declining"
+SHARP_DROP_PCT = 10             # latest session this far below the two before it -> "sharp recent drop (unconfirmed)"
+LIKELY_TYPO_DROP_PCT = 20       # a sharp drop at least this big may be a logging mistake
+LONG_GAP_DAYS = 14              # this many days since the previous session counts as a long break
+HIGH_REP_THRESHOLD = 10         # more reps than this makes the estimated 1RM less reliable
+PLATEAU_WINDOW_DROP_PCT = 5     # plateau: latest two-session average no more than this % below the prior two...
+IMPROVING_WINDOW_GAIN_PCT = 2   # ...and less than this % above them; this % or more -> "improving"
+OTHER_LIFTS_WINDOW_DAYS = 7     # other lifts' sharp drops within this many days count as the same period
 
 # ─────────────────────────────────────────────
 # GEMINI CLIENT
@@ -76,80 +91,110 @@ def build_session_summaries(grouped_dates):
     return summaries
 
 
+def _as_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        return date.fromisoformat(value)
+    return value
+
+
+def _percent_below(value, baseline):
+    return ((baseline - value) / baseline) * 100
+
+
+def latest_drop_percent(sorted_summaries):
+    """How far (in %) the latest session's 1RM is below the average of the two
+    sessions before it. Negative means it is above. None if under 3 sessions."""
+    if len(sorted_summaries) < 3:
+        return None
+    baseline = (sorted_summaries[-3]["estimated_1rm"] + sorted_summaries[-2]["estimated_1rm"]) / 2
+    return _percent_below(sorted_summaries[-1]["estimated_1rm"], baseline)
+
+
 def classify_trend(sorted_summaries, months_training=None):
     num_sessions = len(sorted_summaries)
 
-    if num_sessions < 4:
+    if num_sessions < MIN_SESSIONS:
         return {
             "trend": "not enough data",
             "sessions_logged": num_sessions
         }
 
+    one_rms = [s["estimated_1rm"] for s in sorted_summaries]
+
     declining_streak = 1
     max_declining_streak = 1
     for i in range(1, num_sessions):
-        current_1rm = sorted_summaries[i]["estimated_1rm"]
-        previous_1rm = sorted_summaries[i - 1]["estimated_1rm"]
-        if current_1rm < previous_1rm:
+        if one_rms[i] < one_rms[i - 1]:
             declining_streak += 1
             max_declining_streak = max(max_declining_streak, declining_streak)
         else:
             declining_streak = 1
 
-    starting_1rm = sorted_summaries[0]["estimated_1rm"]
-    current_1rm = sorted_summaries[-1]["estimated_1rm"]
+    starting_1rm = one_rms[0]
+    current_1rm = one_rms[-1]
     percent_change = round(((current_1rm - starting_1rm) / starting_1rm) * 100, 1)
 
-    if max_declining_streak >= 3:
+    base_result = {
+        "sessions_logged": num_sessions,
+        "starting_1rm": starting_1rm,
+        "current_1rm": current_1rm,
+        "percent_change": percent_change
+    }
+
+    # Both of the last two sessions clearly below the two before them. One bad
+    # session on its own never counts.
+    prior_two_avg = (one_rms[-4] + one_rms[-3]) / 2
+    last_two_both_low = all(
+        _percent_below(value, prior_two_avg) >= DECLINE_WINDOW_DROP_PCT
+        for value in one_rms[-2:]
+    )
+
+    if max_declining_streak >= 3 or last_two_both_low:
         return {
             "trend": "declining",
-            "sessions_logged": num_sessions,
             "declining_streak": max_declining_streak,
-            "starting_1rm": starting_1rm,
-            "current_1rm": current_1rm,
-            "percent_change": percent_change
+            **base_result
         }
 
-    ever_improved = False
-    plateau_streak = 0
-    max_plateau_streak = 0
-
-    for i in range(4, num_sessions + 1):
-        recent_two = sorted_summaries[i - 2:i]
-        prior_two = sorted_summaries[i - 4:i - 2]
-
-        recent_avg = sum(s["estimated_1rm"] for s in recent_two) / 2
-        prior_avg = sum(s["estimated_1rm"] for s in prior_two) / 2
-
-        window_change = ((recent_avg - prior_avg) / prior_avg) * 100
-
-        if window_change >= 2:
-            ever_improved = True
-            plateau_streak = 0
-        else:
-            plateau_streak += 1
-            max_plateau_streak = max(max_plateau_streak, plateau_streak)
-
-    if not ever_improved and max_plateau_streak >= 1 and num_sessions >= 4:
+    # A single low latest session: flag it, but don't call it a decline yet.
+    drop = latest_drop_percent(sorted_summaries)
+    if drop >= SHARP_DROP_PCT:
+        latest = sorted_summaries[-1]
+        previous = sorted_summaries[-2]
+        baseline_1rm = (one_rms[-3] + one_rms[-2]) / 2
+        drop_percent = round(drop, 1)
+        days_since_previous = (_as_date(latest["Date"]) - _as_date(previous["Date"])).days
+        latest_reps = latest["actual_reps"]
         return {
-            "trend": "plateau",
-            "sessions_logged": num_sessions,
-            "starting_1rm": starting_1rm,
-            "current_1rm": current_1rm,
-            "percent_change": percent_change
+            "trend": "sharp recent drop (unconfirmed)",
+            **base_result,
+            "drop_percent": drop_percent,
+            "baseline_1rm": round(baseline_1rm, 1),
+            "latest_1rm": round(one_rms[-1], 1),
+            "days_since_previous_session": days_since_previous,
+            "long_gap": days_since_previous >= LONG_GAP_DAYS,
+            "latest_reps": latest_reps,
+            "typical_reps": statistics.median(s["actual_reps"] for s in sorted_summaries[:-1]),
+            "high_rep_set": latest_reps > HIGH_REP_THRESHOLD,
+            "likely_typo": drop_percent >= LIKELY_TYPO_DROP_PCT
         }
 
-    if ever_improved:
+    # Judge the most recent window only, not whether the lifter ever improved.
+    recent_two_avg = (one_rms[-2] + one_rms[-1]) / 2
+    window_change = ((recent_two_avg - prior_two_avg) / prior_two_avg) * 100
+
+    if window_change >= IMPROVING_WINDOW_GAIN_PCT:
         trend_label = "improving"
+    elif window_change >= -PLATEAU_WINDOW_DROP_PCT:
+        trend_label = "plateau"
     else:
         trend_label = "flat"
 
     return {
         "trend": trend_label,
-        "sessions_logged": num_sessions,
-        "starting_1rm": starting_1rm,
-        "current_1rm": current_1rm,
-        "percent_change": percent_change
+        **base_result
     }
 
 
@@ -167,12 +212,29 @@ def get_unique_exercises(user_id):
 
 def get_all_exercise_trends(user_id):
     exercise_trends = {}
+    sharp_drop_dates = {}
     exercise_names = get_unique_exercises(user_id)
     for exercise in exercise_names:
         filtered = filter_by_exercise(user_id, exercise)
         grouped = group_by_date(filtered)
         summaries = build_session_summaries(grouped)
         exercise_trends[exercise] = classify_trend(summaries)
+
+        drop = latest_drop_percent(summaries)
+        if drop is not None and drop >= SHARP_DROP_PCT:
+            sharp_drop_dates[exercise] = _as_date(summaries[-1]["Date"])
+
+    # If several lifts dropped sharply around the same time, the cause may be
+    # general (sleep, illness, stress) rather than specific to one lift.
+    for exercise, trend in exercise_trends.items():
+        if trend["trend"] != "sharp recent drop (unconfirmed)":
+            continue
+        own_date = sharp_drop_dates[exercise]
+        trend["other_lifts_also_dropped"] = any(
+            abs((other_date - own_date).days) <= OTHER_LIFTS_WINDOW_DAYS
+            for other, other_date in sharp_drop_dates.items()
+            if other != exercise
+        )
     return exercise_trends
 
 
@@ -258,6 +320,30 @@ improvement, or decline — do not independently judge trend direction from the 
 numbers alone. Use the raw set/rep/weight data to explain and add color to why 
 the trend looks the way it does, not to override the computed trend label.
 
+The possible trend labels are: "improving", "plateau", "flat", "declining", 
+"sharp recent drop (unconfirmed)" and "not enough data".
+
+"sharp recent drop (unconfirmed)" means only the latest session came in well below 
+the sessions before it. It is NOT yet a decline. For an exercise with this label:
+- State the drop neutrally using the exact "drop_percent" value. Do not calculate 
+  any numbers yourself.
+- Say the app cannot know the cause. Do not diagnose, assume an injury, or claim 
+  any cause.
+- Mention only the possible reasons supported by its fields, plus the always-valid 
+  possibility that it was simply an easy or off day:
+  - "likely_typo" is true: it may be a logging mistake; suggest double-checking the 
+    weight and reps that were entered.
+  - "long_gap" is true: there was a break of "days_since_previous_session" days since 
+    the previous session.
+  - "high_rep_set" is true: the latest set had "latest_reps" reps, and estimates 
+    from high-rep sets are less reliable.
+  - "other_lifts_also_dropped" is true: other lifts dropped around the same time, so 
+    the cause may be general, such as sleep, stress or illness.
+  Do not mention a reason whose field is false or missing.
+- Say it will be flagged as a decline if the next sessions stay low.
+- Include this safety line: if they feel pain or something feels wrong, they should 
+  not push through it and should see a professional.
+
 YOUR TASK:
 Using the user's context, workout history, and computed trends, analyze:
 1. Overall progress since their last workout and over their full recorded history
@@ -278,6 +364,8 @@ RULES:
 - When referencing a percentage change for any exercise, use the exact "percent_change" 
   value provided in the computed trends data — do not calculate or estimate your own 
   percentage.
+- Only use the word "plateau" (or "plateauing") for an exercise whose computed trend 
+  is exactly "plateau".
 - Do not invent data that wasn't provided.
 
 OUTPUT FORMAT:
