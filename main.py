@@ -293,6 +293,51 @@ def update_workout(
         session.close()
 
 
+@app.delete("/workouts/{workout_id}")
+def delete_workout(workout_id: int, current_user_id: str = Depends(get_current_user)):
+    user_uuid = uuid.UUID(current_user_id)
+    session = SessionLocal()
+    try:
+        # Missing and someone else's set get the same 404, so ids can't be probed.
+        row = (
+            session.query(Workout)
+            .filter(Workout.id == workout_id, Workout.user_id == user_uuid)
+            .first()
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Workout set not found")
+
+        day, exercise = row.date, row.exercise
+        session.delete(row)
+        session.flush()
+
+        # Close the gap: this user's remaining sets of the same exercise on the
+        # same day become 1..n, in their current order. Same transaction as
+        # the delete, so either both happen or neither does.
+        remaining = (
+            session.query(Workout)
+            .filter(Workout.user_id == user_uuid, Workout.date == day, Workout.exercise == exercise)
+            .order_by(Workout.set_number, Workout.id)
+            .all()
+        )
+        renumbered = []
+        for new_number, other in enumerate(remaining, start=1):
+            if other.set_number != new_number:
+                other.set_number = new_number
+                renumbered.append({"id": other.id, "set_number": new_number})
+
+        session.commit()
+        return {"message": "Workout set deleted", "id": workout_id, "renumbered": renumbered}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        logger.warning("Workout delete failed: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="Could not delete the workout set. Please try again.")
+    finally:
+        session.close()
+
+
 # Supabase error codes for an email that already has an account.
 EMAIL_TAKEN_CODES = {"user_already_exists", "email_exists"}
 EMAIL_INVALID_CODES = {"email_address_invalid", "validation_failed"}
