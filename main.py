@@ -1,6 +1,10 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field
+from typing import Optional
 from dotenv import load_dotenv
 from supabase import (
     create_client,
@@ -8,6 +12,7 @@ from supabase import (
     AuthInvalidCredentialsError,
     AuthWeakPasswordError,
 )
+from supabase_auth import SyncGoTrueClient
 from pipeline import get_critique, get_profile, calculate_months_training
 from database import Workout, SessionLocal, Profile, CritiqueLog
 from datetime import datetime, time, timedelta, timezone
@@ -16,6 +21,7 @@ from sqlalchemy import func
 import logging
 import math
 import os
+import re
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -99,6 +105,18 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+# Fields are optional here so a missing one gets our own 400 with a plain
+# message (checked in the routes) instead of FastAPI's 422 list.
+class PasswordResetRequest(BaseModel):
+    email: Optional[str] = None
+
+
+class PasswordResetConfirm(BaseModel):
+    email: Optional[str] = None
+    code: Optional[str] = None
+    new_password: Optional[str] = None
 
 
 class ProfileUpdateRequest(BaseModel):
@@ -369,6 +387,124 @@ def login(request: LoginRequest):
         "access_token": auth_response.session.access_token,
         "user_id": auth_response.user.id
     }
+
+
+# ─────────────────────────────────────────────
+# PASSWORD RESET (6-digit code emailed by Supabase)
+# ─────────────────────────────────────────────
+
+RESET_REQUESTED = "If an account exists for that email, we sent a code."
+RESET_DONE = "Password updated. Please log in."
+INVALID_EMAIL = "Please enter a valid email address."
+MISSING_RESET_FIELDS = "Please enter your email, the code and a new password."
+INVALID_CODE = "That code is invalid or has expired."
+WEAK_PASSWORD = "That password is too weak. Please choose a stronger one."
+SAME_PASSWORD = "Your new password must be different from your current one."
+TOO_MANY_REQUESTS = "Too many requests. Please wait a bit before trying again."
+RATE_LIMIT_CODES = {"over_email_send_rate_limit", "over_request_rate_limit"}
+PASSWORD_RESET_PATHS = {"/password-reset/request", "/password-reset/confirm"}
+
+# Deliberately loose: Supabase does the real check. This only catches empty
+# or obviously malformed input before asking Supabase to send an email.
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    # Password-reset errors are always a plain string. Other routes keep
+    # FastAPI's default 422 response.
+    if request.url.path == "/password-reset/request":
+        return JSONResponse(status_code=400, content={"detail": INVALID_EMAIL})
+    if request.url.path == "/password-reset/confirm":
+        return JSONResponse(status_code=400, content={"detail": MISSING_RESET_FIELDS})
+    return await request_validation_exception_handler(request, exc)
+
+
+def _is_rate_limited(e):
+    return getattr(e, "code", None) in RATE_LIMIT_CODES or getattr(e, "status", None) == 429
+
+
+def _new_auth_client():
+    """A throwaway Supabase Auth client for one request. Verifying a recovery
+    code logs that user in on whichever client does it, so this must never be
+    the shared `supabase` client. No storage, no background token refresh."""
+    return SyncGoTrueClient(
+        url=f"{SUPABASE_URL}/auth/v1",
+        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+        auto_refresh_token=False,
+        persist_session=False,
+    )
+
+
+@app.post("/password-reset/request")
+def request_password_reset(body: PasswordResetRequest):
+    email = (body.email or "").strip()
+    if not EMAIL_PATTERN.match(email):
+        raise HTTPException(status_code=400, detail=INVALID_EMAIL)
+
+    try:
+        # Sends the recovery email; nothing is stored on the client.
+        supabase.auth.reset_password_for_email(email)
+    except Exception as e:
+        _log_auth_failure("Password reset request", e)
+        if _is_rate_limited(e):
+            raise HTTPException(status_code=429, detail=TOO_MANY_REQUESTS)
+        if getattr(e, "code", None) in EMAIL_INVALID_CODES:
+            raise HTTPException(status_code=400, detail=INVALID_EMAIL)
+        if not _is_user_error(e):
+            raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
+        # Any other rejection gets the same answer as success, so this
+        # endpoint never reveals whether an email has an account.
+
+    return {"message": RESET_REQUESTED}
+
+
+@app.post("/password-reset/confirm")
+def confirm_password_reset(body: PasswordResetConfirm):
+    email = (body.email or "").strip()
+    code = (body.code or "").strip()
+    new_password = body.new_password or ""
+    if not email or not code or not new_password:
+        raise HTTPException(status_code=400, detail=MISSING_RESET_FIELDS)
+
+    client = _new_auth_client()
+    try:
+        try:
+            verified = client.verify_otp({"email": email, "token": code, "type": "recovery"})
+        except Exception as e:
+            _log_auth_failure("Password reset code check", e)
+            if _is_rate_limited(e):
+                raise HTTPException(status_code=429, detail=TOO_MANY_REQUESTS)
+            if _is_user_error(e):
+                raise HTTPException(status_code=400, detail=INVALID_CODE)
+            raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
+
+        if verified is None or verified.session is None:
+            logger.warning("Password reset code check failed: Supabase returned no session")
+            raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
+
+        try:
+            client.update_user({"password": new_password})
+        except Exception as e:
+            _log_auth_failure("Password update", e)
+            code_name = getattr(e, "code", None)
+            if isinstance(e, AuthWeakPasswordError) or code_name == "weak_password":
+                raise HTTPException(status_code=400, detail=WEAK_PASSWORD)
+            if code_name == "same_password":
+                raise HTTPException(status_code=400, detail=SAME_PASSWORD)
+            if _is_rate_limited(e):
+                raise HTTPException(status_code=429, detail=TOO_MANY_REQUESTS)
+            raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
+    finally:
+        # Don't leave the user logged in: revoke the recovery session and drop
+        # it from this throwaway client.
+        try:
+            if client.get_session() is not None:
+                client.sign_out({"scope": "local"})
+        except Exception as e:
+            _log_auth_failure("Password reset sign-out", e)
+
+    return {"message": RESET_DONE}
 
 
 @app.patch("/profile")
