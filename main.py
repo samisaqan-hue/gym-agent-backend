@@ -2,15 +2,23 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field
 from dotenv import load_dotenv
-from supabase import create_client, AuthApiError
+from supabase import (
+    create_client,
+    AuthApiError,
+    AuthInvalidCredentialsError,
+    AuthWeakPasswordError,
+)
 from pipeline import get_critique, get_profile, calculate_months_training
 from database import Workout, SessionLocal, Profile, CritiqueLog
 from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from sqlalchemy import func
+import logging
 import math
 import os
 import uuid
+
+logger = logging.getLogger(__name__)
 
 DAILY_CRITIQUE_LIMIT = 1
 CRITIQUE_TIMEZONE = "America/Chicago"
@@ -263,6 +271,27 @@ def update_workout(
         session.close()
 
 
+# Supabase error codes for an email that already has an account.
+EMAIL_TAKEN_CODES = {"user_already_exists", "email_exists"}
+EMAIL_INVALID_CODES = {"email_address_invalid", "validation_failed"}
+
+AUTH_UNAVAILABLE = "The account service is unavailable right now. Please try again in a moment."
+
+
+def _is_user_error(e):
+    # A 4xx answer from Supabase about the request itself, or a check the client
+    # library does before sending (e.g. a missing email or password).
+    if isinstance(e, AuthInvalidCredentialsError):
+        return True
+    return isinstance(e, AuthApiError) and 400 <= e.status < 500 and e.status != 429
+
+
+def _log_auth_failure(action, e):
+    # Only the error class and Supabase's error code: never the message, the
+    # email, the password or a token.
+    logger.warning("%s failed: %s (code=%s)", action, type(e).__name__, getattr(e, "code", None))
+
+
 @app.post("/signup")
 def signup(request: SignupRequest):
     try:
@@ -270,9 +299,28 @@ def signup(request: SignupRequest):
             "email": request.email,
             "password": request.password
         })
-        new_user_id = auth_response.user.id
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Signup failed: {str(e)}")
+        _log_auth_failure("Signup", e)
+        code = getattr(e, "code", None)
+        if code in EMAIL_TAKEN_CODES:
+            raise HTTPException(
+                status_code=409,
+                detail="An account with this email already exists. Try logging in instead.",
+            )
+        if isinstance(e, AuthWeakPasswordError) or code == "weak_password":
+            raise HTTPException(status_code=400, detail="That password is too weak. Please choose a stronger one.")
+        if isinstance(e, AuthInvalidCredentialsError):
+            raise HTTPException(status_code=400, detail="Please enter an email and password.")
+        if code in EMAIL_INVALID_CODES:
+            raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+        if _is_user_error(e):
+            raise HTTPException(status_code=400, detail="Sign-up failed. Please check your details and try again.")
+        raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
+
+    if auth_response is None or auth_response.user is None:
+        # No account was created, so don't create a profile for one.
+        raise HTTPException(status_code=400, detail="Sign-up failed. Please check your details and try again.")
+    new_user_id = auth_response.user.id
 
     try:
         new_profile = Profile(
@@ -294,10 +342,22 @@ def signup(request: SignupRequest):
 
 @app.post("/login")
 def login(request: LoginRequest):
-    auth_response = supabase.auth.sign_in_with_password({
-        "email": request.email,
-        "password": request.password
-    })
+    try:
+        auth_response = supabase.auth.sign_in_with_password({
+            "email": request.email,
+            "password": request.password
+        })
+    except Exception as e:
+        _log_auth_failure("Login", e)
+        # Wrong password and unknown email get the same answer, so this can't
+        # be used to find out which emails have accounts.
+        if _is_user_error(e):
+            raise HTTPException(status_code=401, detail="Incorrect email or password.")
+        raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
+
+    if auth_response is None or auth_response.session is None or auth_response.user is None:
+        logger.warning("Login failed: Supabase returned no session")
+        raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
 
     return {
         "access_token": auth_response.session.access_token,
