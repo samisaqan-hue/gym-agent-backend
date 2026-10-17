@@ -200,7 +200,15 @@ def test_login_success_response_is_unchanged(client, fake_supabase):
     response = client.post("/login", json=LOGIN_BODY)
 
     assert response.status_code == 200
-    assert response.json() == {"access_token": "access-token-123", "user_id": USER_ID}
+    body = response.json()
+    # The original fields, exactly as before (old app versions rely on them).
+    assert body["access_token"] == "access-token-123"
+    assert body["user_id"] == USER_ID
+    # Plus the refresh-token fields, with the values Supabase returned.
+    assert body["refresh_token"] == SESSION_JSON["refresh_token"] == "refresh-token-456"
+    assert body["expires_in"] == SESSION_JSON["expires_in"] == 3600
+    # Nothing else.
+    assert set(body) == {"access_token", "user_id", "refresh_token", "expires_in"}
 
 
 def test_login_wrong_password_is_401(client, fake_supabase):

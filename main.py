@@ -119,6 +119,10 @@ class PasswordResetConfirm(BaseModel):
     new_password: Optional[str] = None
 
 
+class RefreshRequest(BaseModel):
+    refresh_token: Optional[str] = None
+
+
 class ProfileUpdateRequest(BaseModel):
     height: str
     bodyweight: str
@@ -367,7 +371,10 @@ def signup(request: SignupRequest):
 @app.post("/login")
 def login(request: LoginRequest):
     try:
-        auth_response = supabase.auth.sign_in_with_password({
+        # Per-request client: signing in on the shared client would keep this
+        # user's session there and start a background refresh that rotates the
+        # refresh token the app now holds, making it look reused.
+        auth_response = _new_auth_client().sign_in_with_password({
             "email": request.email,
             "password": request.password
         })
@@ -385,7 +392,9 @@ def login(request: LoginRequest):
 
     return {
         "access_token": auth_response.session.access_token,
-        "user_id": auth_response.user.id
+        "user_id": auth_response.user.id,
+        "refresh_token": auth_response.session.refresh_token,
+        "expires_in": auth_response.session.expires_in,
     }
 
 
@@ -417,6 +426,8 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
         return JSONResponse(status_code=400, content={"detail": INVALID_EMAIL})
     if request.url.path == "/password-reset/confirm":
         return JSONResponse(status_code=400, content={"detail": MISSING_RESET_FIELDS})
+    if request.url.path == "/refresh":
+        return JSONResponse(status_code=400, content={"detail": LOG_IN_AGAIN})
     return await request_validation_exception_handler(request, exc)
 
 
@@ -425,14 +436,18 @@ def _is_rate_limited(e):
 
 
 def _new_auth_client():
-    """A throwaway Supabase Auth client for one request. Verifying a recovery
-    code logs that user in on whichever client does it, so this must never be
-    the shared `supabase` client. No storage, no background token refresh."""
+    """A throwaway Supabase Auth client for one request. Signing in, verifying
+    a recovery code or refreshing a session saves that user's session on
+    whichever client does it, so this must never be the shared `supabase`
+    client. No storage, no background token refresh. It reuses the shared
+    client's HTTP connection pool (which holds no user state) instead of
+    opening a new one each time."""
     return SyncGoTrueClient(
         url=f"{SUPABASE_URL}/auth/v1",
         headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
         auto_refresh_token=False,
         persist_session=False,
+        http_client=supabase.auth._http_client,
     )
 
 
@@ -505,6 +520,45 @@ def confirm_password_reset(body: PasswordResetConfirm):
             _log_auth_failure("Password reset sign-out", e)
 
     return {"message": RESET_DONE}
+
+
+# ─────────────────────────────────────────────
+# SESSION REFRESH
+# ─────────────────────────────────────────────
+
+LOG_IN_AGAIN = "Please log in again."
+SESSION_EXPIRED = "Your session has expired. Please log in again."
+
+
+@app.post("/refresh")
+def refresh_session(body: RefreshRequest):
+    # No Authorization header: the access token has usually expired by now.
+    refresh_token = (body.refresh_token or "").strip()
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail=LOG_IN_AGAIN)
+
+    try:
+        # Per-request client, never the shared one. It is simply dropped
+        # afterwards: signing it out would revoke the session just issued.
+        refreshed = _new_auth_client().refresh_session(refresh_token)
+    except Exception as e:
+        _log_auth_failure("Session refresh", e)
+        if _is_rate_limited(e):
+            raise HTTPException(status_code=429, detail=TOO_MANY_REQUESTS)
+        if _is_user_error(e):
+            # Invalid, expired, revoked or already-used refresh token.
+            raise HTTPException(status_code=401, detail=SESSION_EXPIRED)
+        raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
+
+    if refreshed is None or refreshed.session is None:
+        logger.warning("Session refresh failed: Supabase returned no session")
+        raise HTTPException(status_code=503, detail=AUTH_UNAVAILABLE)
+
+    return {
+        "access_token": refreshed.session.access_token,
+        "refresh_token": refreshed.session.refresh_token,
+        "expires_in": refreshed.session.expires_in,
+    }
 
 
 @app.patch("/profile")
