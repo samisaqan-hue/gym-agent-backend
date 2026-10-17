@@ -282,3 +282,73 @@ def test_no_password_email_or_supabase_text_in_response_or_logs(client, fake_sup
                    "Service Unavailable", "connection refused", "supabase.co"):
         assert leaked not in detail
         assert leaked not in logs
+
+
+# ── Signup: placeholder user for an existing email ─────────────
+
+IDENTITY_JSON = {
+    "id": USER_ID, "identity_id": "9b1c2d3e-0000-4000-8000-000000000001", "user_id": USER_ID,
+    "identity_data": {"sub": USER_ID, "email": EMAIL}, "provider": "email",
+    "created_at": "2026-10-17T00:00:00Z",
+}
+# What Supabase Auth sends back instead of an error for an email that already
+# has an account: a user (with a made-up id) whose identities list is empty,
+# and no session.
+PLACEHOLDER_USER_JSON = {
+    "id": "0f5d9a2e-1111-4222-8333-444455556666", "aud": "authenticated", "role": "",
+    "email": EMAIL, "phone": "", "app_metadata": {"provider": "email", "providers": ["email"]},
+    "user_metadata": {}, "identities": [], "created_at": "2026-10-17T00:00:00Z",
+    "updated_at": "2026-10-17T00:00:00Z", "is_anonymous": False,
+}
+NEW_USER_JSON = {**USER_JSON, "identities": [IDENTITY_JSON]}
+
+
+def test_signup_placeholder_user_is_409_and_creates_no_profile(client, fake_supabase, db):
+    fake_supabase["handler"] = httpx.Response(200, json=PLACEHOLDER_USER_JSON, headers=API_VERSION)
+
+    response = client.post("/signup", json=SIGNUP_BODY)
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": EMAIL_TAKEN}
+    assert profile_count(db) == 0
+
+
+def test_placeholder_user_gets_the_same_response_as_the_duplicate_email_error(client, fake_supabase, db):
+    fake_supabase["handler"] = httpx.Response(200, json=PLACEHOLDER_USER_JSON, headers=API_VERSION)
+    placeholder = client.post("/signup", json=SIGNUP_BODY)
+
+    fake_supabase["handler"] = supabase_error(422, "user_already_exists", "User already registered")
+    raised = client.post("/signup", json=SIGNUP_BODY)
+
+    assert placeholder.status_code == raised.status_code == 409
+    assert placeholder.content == raised.content
+    assert profile_count(db) == 0
+
+
+@pytest.mark.parametrize("supabase_body", [
+    # Email confirmation off: a session and the new user come back.
+    {**SESSION_JSON, "user": NEW_USER_JSON},
+    # Email confirmation on: just the new user, with its identity, no session.
+    NEW_USER_JSON,
+], ids=["with-session", "user-only"])
+def test_new_signup_with_an_identity_still_succeeds(client, fake_supabase, db, supabase_body):
+    fake_supabase["handler"] = httpx.Response(200, json=supabase_body, headers=API_VERSION)
+
+    response = client.post("/signup", json=SIGNUP_BODY)
+
+    assert response.status_code == 200
+    assert response.json() == {"message": "Signup successful", "user_id": USER_ID}
+    assert profile_count(db) == 1
+    assert db.saved[0].id == USER_ID
+
+
+def test_placeholder_user_logs_nothing_sensitive(client, fake_supabase, caplog):
+    fake_supabase["handler"] = httpx.Response(200, json=PLACEHOLDER_USER_JSON, headers=API_VERSION)
+
+    with caplog.at_level(logging.DEBUG, logger="main"):
+        client.post("/signup", json=SIGNUP_BODY)
+
+    logs = "\n".join(record.getMessage() for record in caplog.records if record.name == "main")
+    assert "placeholder user" in logs
+    for leaked in (PASSWORD, EMAIL, PLACEHOLDER_USER_JSON["id"]):
+        assert leaked not in logs

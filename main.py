@@ -274,6 +274,7 @@ def update_workout(
 # Supabase error codes for an email that already has an account.
 EMAIL_TAKEN_CODES = {"user_already_exists", "email_exists"}
 EMAIL_INVALID_CODES = {"email_address_invalid", "validation_failed"}
+EMAIL_TAKEN_DETAIL = "An account with this email already exists. Try logging in instead."
 
 AUTH_UNAVAILABLE = "The account service is unavailable right now. Please try again in a moment."
 
@@ -303,10 +304,7 @@ def signup(request: SignupRequest):
         _log_auth_failure("Signup", e)
         code = getattr(e, "code", None)
         if code in EMAIL_TAKEN_CODES:
-            raise HTTPException(
-                status_code=409,
-                detail="An account with this email already exists. Try logging in instead.",
-            )
+            raise HTTPException(status_code=409, detail=EMAIL_TAKEN_DETAIL)
         if isinstance(e, AuthWeakPasswordError) or code == "weak_password":
             raise HTTPException(status_code=400, detail="That password is too weak. Please choose a stronger one.")
         if isinstance(e, AuthInvalidCredentialsError):
@@ -320,6 +318,14 @@ def signup(request: SignupRequest):
     if auth_response is None or auth_response.user is None:
         # No account was created, so don't create a profile for one.
         raise HTTPException(status_code=400, detail="Sign-up failed. Please check your details and try again.")
+
+    # For an email that already has an account, Supabase can answer with a
+    # placeholder user instead of an error (so the response doesn't reveal
+    # which emails exist). That user has an empty identities list; a real new
+    # user always has one identity. No account was created, so no profile.
+    if auth_response.user.identities is not None and len(auth_response.user.identities) == 0:
+        logger.warning("Signup failed: existing email (placeholder user returned)")
+        raise HTTPException(status_code=409, detail=EMAIL_TAKEN_DETAIL)
     new_user_id = auth_response.user.id
 
     try:
